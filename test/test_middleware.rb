@@ -1,4 +1,4 @@
-require 'helper'
+require_relative 'helper'
 require 'sidekiq/middleware/chain'
 require 'sidekiq/processor'
 
@@ -79,12 +79,10 @@ class TestMiddleware < Sidekiq::Test
       end
 
       boss = Minitest::Mock.new
+      boss.expect(:options, {:queues => ['default'] }, [])
+      boss.expect(:options, {:queues => ['default'] }, [])
       processor = Sidekiq::Processor.new(boss)
-      actor = Minitest::Mock.new
-      actor.expect(:processor_done, nil, [processor])
-      actor.expect(:real_thread, nil, [nil, Thread])
-      boss.expect(:async, actor, [])
-      boss.expect(:async, actor, [])
+      boss.expect(:processor_done, nil, [processor])
       processor.process(Sidekiq::BasicFetch::UnitOfWork.new('queue:default', msg))
       assert_equal %w(2 before 3 before 1 before work_performed 1 after 3 after 2 after), $recorder.flatten
     end
@@ -94,6 +92,15 @@ class TestMiddleware < Sidekiq::Test
       chain.add Sidekiq::Middleware::Server::RetryJobs
       chain.add Sidekiq::Middleware::Server::RetryJobs, {:max_retries => 5}
       assert_equal 1, chain.count
+    end
+
+    it 'correctly prepends middleware' do
+      chain = Sidekiq::Middleware::Chain.new
+      chain_entries = chain.entries
+      chain.add CustomMiddleware
+      chain.prepend YetAnotherCustomMiddleware
+      assert_equal YetAnotherCustomMiddleware, chain_entries.first.klass
+      assert_equal CustomMiddleware, chain_entries.last.klass
     end
 
     it 'allows middleware to abruptly stop processing rest of chain' do

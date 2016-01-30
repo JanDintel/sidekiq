@@ -1,3 +1,4 @@
+# encoding: utf-8
 $stdout.sync = true
 
 require 'yaml'
@@ -10,17 +11,17 @@ require 'sidekiq'
 require 'sidekiq/util'
 
 module Sidekiq
-  # We are shutting down Sidekiq but what about workers that
-  # are working on some long job?  This error is
-  # raised in workers that have not finished within the hard
-  # timeout limit.  This is needed to rollback db transactions,
-  # otherwise Ruby's Thread#kill will commit.  See #377.
-  # DO NOT RESCUE THIS ERROR.
-  class Shutdown < Interrupt; end
-
   class CLI
     include Util
-    include Singleton
+    include Singleton unless $TESTING
+
+    PROCTITLES = [
+      proc { 'sidekiq'.freeze },
+      proc { Sidekiq::VERSION },
+      proc { |me, data| data['tag'] },
+      proc { |me, data| "[#{Processor::WORKER_STATE.size} of #{data['concurrency']} busy]" },
+      proc { |me, data| "stopping" if me.stopping? },
+    ]
 
     # Used for CLI testing
     attr_accessor :code
@@ -39,17 +40,14 @@ module Sidekiq
       validate!
       daemonize
       write_pid
-      load_celluloid
-      boot_system
     end
 
+    # Code within this method is not tested because it alters
+    # global process state irreversibly.  PRs which improve the
+    # test coverage of Sidekiq::CLI are welcomed.
     def run
-      # Print logo and banner for development
-      if environment == 'development' && $stdout.tty?
-        puts "\e[#{31}m"
-        puts Sidekiq::BANNER
-        puts "\e[0m"
-      end
+      boot_system
+      print_banner
 
       self_read, self_write = IO.pipe
 
@@ -65,8 +63,21 @@ module Sidekiq
 
       logger.info "Running in #{RUBY_DESCRIPTION}"
       logger.info Sidekiq::LICENSE
+      logger.info "Upgrade to Sidekiq Pro for more features and support: http://sidekiq.org" unless defined?(::Sidekiq::Pro)
 
+      Sidekiq.redis do |conn|
+        # touch the connection pool so it is created before we
+        # fire startup and start multithreading.
+        ver = conn.info['redis_version']
+        raise "You are using Redis v#{ver}, Sidekiq requires Redis v2.8.0 or greater" if ver < '2.8'
+      end
+
+      # Before this point, the process is initializing with just the main thread.
+      # Starting here the process will now have multiple threads running.
       fire_event(:startup)
+
+      logger.debug { "Client Middleware: #{Sidekiq.client_middleware.map(&:klass).join(', ')}" }
+      logger.debug { "Server Middleware: #{Sidekiq.server_middleware.map(&:klass).join(', ')}" }
 
       if !options[:daemon]
         logger.info 'Starting processing, hit Ctrl-C to stop'
@@ -85,23 +96,28 @@ module Sidekiq
       rescue Interrupt
         logger.info 'Shutting down'
         launcher.stop
-        fire_event(:shutdown)
         # Explicitly exit so busy Processor threads can't block
         # process shutdown.
+        logger.info "Bye!"
         exit(0)
       end
     end
 
-    private
-
-    def fire_event(event)
-      Sidekiq.options[:lifecycle_events][event].each do |block|
-        begin
-          block.call
-        rescue => ex
-          handle_exception(ex, { :event => event })
-        end
-      end
+    def self.banner
+%q{
+         m,
+         `$b
+    .ss,  $$:         .,d$
+    `$$P,d$P'    .,md$P"'
+     ,$$$$$bmmd$$$P^'
+   .d$$$$$$$$$$P'
+   $$^' `"^$$$'       ____  _     _      _    _
+   $:     ,$$:       / ___|(_) __| | ___| | _(_) __ _
+   `b     :$$        \___ \| |/ _` |/ _ \ |/ / |/ _` |
+          $$:         ___) | | (_| |  __/   <| | (_| |
+          $$         |____/|_|\__,_|\___|_|\_\_|\__, |
+        .d$$                                       |_|
+}
     end
 
     def handle_signal(sig)
@@ -116,8 +132,7 @@ module Sidekiq
         raise Interrupt
       when 'USR1'
         Sidekiq.logger.info "Received USR1, no longer accepting new work"
-        launcher.manager.async.stop
-        fire_event(:quiet)
+        launcher.quiet
       when 'USR2'
         if Sidekiq.options[:logfile]
           Sidekiq.logger.info "Received USR2, reopening log file"
@@ -125,27 +140,25 @@ module Sidekiq
         end
       when 'TTIN'
         Thread.list.each do |thread|
-          Sidekiq.logger.info "Thread TID-#{thread.object_id.to_s(36)} #{thread['label']}"
+          Sidekiq.logger.warn "Thread TID-#{thread.object_id.to_s(36)} #{thread['label']}"
           if thread.backtrace
-            Sidekiq.logger.info thread.backtrace.join("\n")
+            Sidekiq.logger.warn thread.backtrace.join("\n")
           else
-            Sidekiq.logger.info "<no backtrace available>"
+            Sidekiq.logger.warn "<no backtrace available>"
           end
         end
       end
     end
 
-    def load_celluloid
-      raise "Celluloid cannot be required until here, or it will break Sidekiq's daemonization" if defined?(::Celluloid) && options[:daemon]
+    private
 
-      # Celluloid can't be loaded until after we've daemonized
-      # because it spins up threads and creates locks which get
-      # into a very bad state if forked.
-      require 'celluloid/autostart'
-      Celluloid.logger = (options[:verbose] ? Sidekiq.logger : nil)
-
-      require 'sidekiq/manager'
-      require 'sidekiq/scheduled'
+    def print_banner
+      # Print logo and banner for development
+      if environment == 'development' && $stdout.tty?
+        puts "\e[#{31}m"
+        puts Sidekiq::CLI.banner
+        puts "\e[0m"
+      end
     end
 
     def daemonize
@@ -157,7 +170,7 @@ module Sidekiq
         files_to_reopen << file unless file.closed?
       end
 
-      Process.daemon(true, true)
+      ::Process.daemon(true, true)
 
       files_to_reopen.each do |file|
         begin
@@ -182,9 +195,8 @@ module Sidekiq
       @environment = cli_env || ENV['RAILS_ENV'] || ENV['RACK_ENV'] || 'development'
     end
 
-    def die(code)
-      exit(code)
-    end
+    alias_method :die, :exit
+    alias_method :☠, :exit
 
     def setup_options(args)
       opts = parse_options(args)
@@ -209,9 +221,19 @@ module Sidekiq
 
       if File.directory?(options[:require])
         require 'rails'
-        require 'sidekiq/rails'
-        require File.expand_path("#{options[:require]}/config/environment.rb")
-        ::Rails.application.eager_load!
+        if ::Rails::VERSION::MAJOR < 4
+          require 'sidekiq/rails'
+          require File.expand_path("#{options[:require]}/config/environment.rb")
+          ::Rails.application.eager_load!
+        else
+          # Painful contortions, see 1791 for discussion
+          require File.expand_path("#{options[:require]}/config/application.rb")
+          ::Rails::Application.initializer "sidekiq.eager_load" do
+            ::Rails.application.config.eager_load = true
+          end
+          require 'sidekiq/rails'
+          require File.expand_path("#{options[:require]}/config/environment.rb")
+        end
         options[:tag] ||= default_tag
       else
         require options[:require]
@@ -240,6 +262,10 @@ module Sidekiq
         logger.info "=================================================================="
         logger.info @parser
         die(1)
+      end
+
+      [:concurrency, :timeout].each do |opt|
+        raise ArgumentError, "#{opt}: #{options[opt]} is not a valid value" if options.has_key?(opt) && options[opt].to_i <= 0
       end
     end
 
@@ -308,7 +334,11 @@ module Sidekiq
         die 1
       end
       @parser.parse!(argv)
-      opts[:config_file] ||= 'config/sidekiq.yml' if File.exist?('config/sidekiq.yml')
+
+      %w[config/sidekiq.yml config/sidekiq.yml.erb].each do |filename|
+        opts[:config_file] ||= filename if File.exist?(filename)
+      end
+
       opts
     end
 
@@ -322,10 +352,7 @@ module Sidekiq
       if path = options[:pidfile]
         pidfile = File.expand_path(path)
         File.open(pidfile, 'w') do |f|
-          f.puts Process.pid
-        end
-        at_exit do
-          FileUtils.rm_f pidfile
+          f.puts ::Process.pid
         end
       end
     end
@@ -333,7 +360,7 @@ module Sidekiq
     def parse_config(cfile)
       opts = {}
       if File.exist?(cfile)
-        opts = YAML.load(ERB.new(IO.read(cfile)).result)
+        opts = YAML.load(ERB.new(IO.read(cfile)).result) || opts
         opts = opts.merge(opts.delete(environment) || {})
         parse_queues(opts, opts.delete(:queues) || [])
       else

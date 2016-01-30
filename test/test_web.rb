@@ -1,7 +1,8 @@
-require 'helper'
-require 'sidekiq'
+# encoding: utf-8
+require_relative 'helper'
 require 'sidekiq/web'
 require 'rack/test'
+require 'tilt/erubis'
 
 class TestWeb < Sidekiq::Test
 
@@ -17,7 +18,6 @@ class TestWeb < Sidekiq::Test
     end
 
     before do
-      Sidekiq.redis = REDIS
       Sidekiq.redis {|c| c.flushdb }
     end
 
@@ -29,22 +29,66 @@ class TestWeb < Sidekiq::Test
       end
     end
 
-    it 'can display workers' do
-      Sidekiq.redis do |conn|
-        conn.incr('busy')
-        conn.sadd('processes', 'foo:1234')
-        conn.hmset('foo:1234', 'info', Sidekiq.dump_json('hostname' => 'foo', 'started_at' => Time.now.to_f), 'at', Time.now.to_f, 'busy', 4)
-        identity = 'foo:1234:workers'
-        hash = {:queue => 'critical', :payload => { 'class' => WebWorker.name, 'args' => [1,'abc'] }, :run_at => Time.now.to_i }
-        conn.hmset(identity, 1001, Sidekiq.dump_json(hash))
-      end
-      assert_equal ['1001'], Sidekiq::Workers.new.map { |pid, tid, data| tid }
+    it 'can show text with any locales' do
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'ru,en'}
+      get '/', {}, rackenv
+      assert_match(/Панель управления/, last_response.body)
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'es,en'}
+      get '/', {}, rackenv
+      assert_match(/Panel de Control/, last_response.body)
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'en-us'}
+      get '/', {}, rackenv
+      assert_match(/Dashboard/, last_response.body)
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'zh-cn'}
+      get '/', {}, rackenv
+      assert_match(/信息板/, last_response.body)
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'zh-tw'}
+      get '/', {}, rackenv
+      assert_match(/資訊主頁/, last_response.body)
+      rackenv = {'HTTP_ACCEPT_LANGUAGE' => 'nb'}
+      get '/', {}, rackenv
+      assert_match(/Oversikt/, last_response.body)
+    end
 
-      get '/busy'
-      assert_equal 200, last_response.status
-      assert_match(/status-active/, last_response.body)
-      assert_match(/critical/, last_response.body)
-      assert_match(/WebWorker/, last_response.body)
+    describe 'busy' do
+
+      it 'can display workers' do
+        Sidekiq.redis do |conn|
+          conn.incr('busy')
+          conn.sadd('processes', 'foo:1234')
+          conn.hmset('foo:1234', 'info', Sidekiq.dump_json('hostname' => 'foo', 'started_at' => Time.now.to_f, "queues" => []), 'at', Time.now.to_f, 'busy', 4)
+          identity = 'foo:1234:workers'
+          hash = {:queue => 'critical', :payload => { 'class' => WebWorker.name, 'args' => [1,'abc'] }, :run_at => Time.now.to_i }
+          conn.hmset(identity, 1001, Sidekiq.dump_json(hash))
+        end
+        assert_equal ['1001'], Sidekiq::Workers.new.map { |pid, tid, data| tid }
+
+        get '/busy'
+        assert_equal 200, last_response.status
+        assert_match(/status-active/, last_response.body)
+        assert_match(/critical/, last_response.body)
+        assert_match(/WebWorker/, last_response.body)
+      end
+
+      it 'can quiet a process' do
+        identity = 'identity'
+        signals_key = "#{identity}-signals"
+
+        assert_nil Sidekiq.redis { |c| c.lpop signals_key }
+        post '/busy', 'quiet' => '1', 'identity' => identity
+        assert_equal 302, last_response.status
+        assert_equal 'USR1', Sidekiq.redis { |c| c.lpop signals_key }
+      end
+
+      it 'can stop a process' do
+        identity = 'identity'
+        signals_key = "#{identity}-signals"
+
+        assert_nil Sidekiq.redis { |c| c.lpop signals_key }
+        post '/busy', 'stop' => '1', 'identity' => identity
+        assert_equal 302, last_response.status
+        assert_equal 'TERM', Sidekiq.redis { |c| c.lpop signals_key }
+      end
     end
 
     it 'can display queues' do
@@ -75,7 +119,7 @@ class TestWeb < Sidekiq::Test
 
       Sidekiq.redis do |conn|
         refute conn.smembers('queues').include?('foo')
-        refute conn.exists('queues:foo')
+        refute conn.exists('queue:foo')
       end
     end
 
@@ -152,6 +196,17 @@ class TestWeb < Sidekiq::Test
       assert_equal 'http://example.org/retries', last_response.header['Location']
 
       get '/queues/default'
+      assert_equal 200, last_response.status
+      assert_match(/#{params.first['args'][2]}/, last_response.body)
+    end
+
+    it 'can kill a single retry now' do
+      params = add_retry
+      post "/retries/#{job_params(*params)}", 'kill' => 'Kill'
+      assert_equal 302, last_response.status
+      assert_equal 'http://example.org/retries', last_response.header['Location']
+
+      get '/morgue'
       assert_equal 200, last_response.status
       assert_match(/#{params.first['args'][2]}/, last_response.body)
     end
@@ -245,7 +300,13 @@ class TestWeb < Sidekiq::Test
 
       get '/queues/default'
       assert_equal 200, last_response.status
-      assert_match /#{msg['args'][2]}/, last_response.body
+      assert_match(/#{msg['args'][2]}/, last_response.body)
+    end
+
+    it 'calls updatePage() once when polling' do
+      get '/busy?poll=true'
+      assert_equal 200, last_response.status
+      assert_equal 1, last_response.body.scan('updatePage(').count
     end
 
     it 'escape job args and error messages' do
@@ -265,7 +326,7 @@ class TestWeb < Sidekiq::Test
       Sidekiq.redis do |conn|
         pro = 'foo:1234'
         conn.sadd('processes', pro)
-        conn.hmset(pro, 'info', Sidekiq.dump_json('started_at' => Time.now.to_f), 'busy', 1, 'beat', Time.now.to_f)
+        conn.hmset(pro, 'info', Sidekiq.dump_json('started_at' => Time.now.to_f, 'labels' => ['frumduz'], 'queues' =>[]), 'busy', 1, 'beat', Time.now.to_f)
         identity = "#{pro}:workers"
         hash = {:queue => 'critical', :payload => { 'class' => "FailWorker", 'args' => ["<a>hello</a>"] }, :run_at => Time.now.to_i }
         conn.hmset(identity, 100001, Sidekiq.dump_json(hash))
@@ -275,6 +336,7 @@ class TestWeb < Sidekiq::Test
       get '/busy'
       assert_equal 200, last_response.status
       assert_match(/FailWorker/, last_response.body)
+      assert_match(/frumduz/, last_response.body)
       assert last_response.body.include?( "&lt;a&gt;hello&lt;&#x2F;a&gt;" )
       assert !last_response.body.include?( "<a>hello</a>" )
 
@@ -307,19 +369,32 @@ class TestWeb < Sidekiq::Test
       assert_equal 200, last_response.status
     end
 
-    Sidekiq::Web.settings.locales << File.join(File.dirname(__FILE__), "fixtures")
-    it 'can show user defined tab with custom locales' do
-      begin
+    describe 'custom locales' do
+      before do
+        Sidekiq::Web.settings.locales << File.join(File.dirname(__FILE__), "fixtures")
         Sidekiq::Web.tabs['Custom Tab'] = '/custom'
         Sidekiq::Web.get('/custom') do
+          clear_caches # ugly hack since I can't figure out how to access WebHelpers outside of this context
           t('translated_text')
         end
+      end
 
+      after do
+        Sidekiq::Web.tabs.delete 'Custom Tab'
+        Sidekiq::Web.settings.locales.pop
+      end
+
+      it 'can show user defined tab with custom locales' do
         get '/custom'
         assert_match(/Changed text/, last_response.body)
+      end
+    end
 
-      ensure
-        Sidekiq::Web.tabs.delete 'Custom Tab'
+    describe 'dashboard/stats' do
+      it 'redirects to stats' do
+        get '/dashboard/stats'
+        assert_equal 302, last_response.status
+        assert_equal 'http://example.org/stats', last_response.header['Location']
       end
     end
 
@@ -330,12 +405,13 @@ class TestWeb < Sidekiq::Test
         Sidekiq.redis do |conn|
           conn.set("stat:processed", 5)
           conn.set("stat:failed", 2)
+          conn.sadd("queues", "default")
         end
         2.times { add_retry }
         3.times { add_scheduled }
         4.times { add_worker }
 
-        get '/dashboard/stats'
+        get '/stats'
         @response = Sidekiq.load_json(last_response.body)
       end
 
@@ -360,6 +436,10 @@ class TestWeb < Sidekiq::Test
           assert_equal 4, @response["sidekiq"]["busy"]
         end
 
+        it 'reports processes' do
+          assert_equal 1, @response["sidekiq"]["processes"]
+        end
+
         it 'reports retries' do
           assert_equal 2, @response["sidekiq"]["retries"]
         end
@@ -377,6 +457,50 @@ class TestWeb < Sidekiq::Test
         it 'are namespaced' do
           assert_includes @response.keys, "redis"
         end
+
+        it 'reports version' do
+          assert_includes @response["redis"].keys, "redis_version"
+        end
+
+        it 'reports uptime' do
+          assert_includes @response["redis"].keys, "uptime_in_days"
+        end
+
+        it 'reports connected clients' do
+          assert_includes @response["redis"].keys, "connected_clients"
+        end
+
+        it 'reports user memory' do
+          assert_includes @response["redis"].keys, "used_memory_human"
+        end
+
+        it 'reports memory peak' do
+          assert_includes @response["redis"].keys, "used_memory_peak_human"
+        end
+      end
+    end
+
+    describe 'stats/queues' do
+      include Sidekiq::Util
+
+      before do
+        Sidekiq.redis do |conn|
+          conn.set("stat:processed", 5)
+          conn.set("stat:failed", 2)
+          conn.sadd("queues", "default")
+          conn.sadd("queues", "queue2")
+        end
+        2.times { add_retry }
+        3.times { add_scheduled }
+        4.times { add_worker }
+
+        get '/stats/queues'
+        @response = Sidekiq.load_json(last_response.body)
+      end
+
+      it 'reports the queue depth' do
+        assert_equal 0, @response["default"]
+        assert_equal 0, @response["queue2"]
       end
     end
 
@@ -480,7 +604,7 @@ class TestWeb < Sidekiq::Test
       Sidekiq.redis do |conn|
         conn.multi do
           conn.sadd("processes", key)
-          conn.hmset(key, 'busy', 4)
+          conn.hmset(key, 'info', Sidekiq.dump_json('hostname' => 'foo', 'started_at' => Time.now.to_f, "queues" => []), 'at', Time.now.to_f, 'busy', 4)
           conn.hmset("#{key}:workers", Time.now.to_f, msg)
         end
       end

@@ -1,5 +1,7 @@
 # encoding: utf-8
 require 'sidekiq/version'
+fail "Sidekiq #{Sidekiq::VERSION} does not support Ruby 1.9." if RUBY_PLATFORM != 'java' && RUBY_VERSION < '2.0.0'
+
 require 'sidekiq/logging'
 require 'sidekiq/client'
 require 'sidekiq/worker'
@@ -8,25 +10,35 @@ require 'sidekiq/redis_connection'
 require 'json'
 
 module Sidekiq
-  NAME = "Sidekiq"
+  NAME = 'Sidekiq'
   LICENSE = 'See LICENSE and the LGPL-3.0 for licensing details.'
 
   DEFAULTS = {
-    :queues => [],
-    :concurrency => 25,
-    :require => '.',
-    :environment => nil,
-    :timeout => 8,
-    :error_handlers => [],
-    :lifecycle_events => {
-      :startup => [],
-      :quiet => [],
-      :shutdown => [],
+    queues: [],
+    labels: [],
+    concurrency: 25,
+    require: '.',
+    environment: nil,
+    timeout: 8,
+    poll_interval_average: nil,
+    average_scheduled_poll_interval: 15,
+    error_handlers: [],
+    lifecycle_events: {
+      startup: [],
+      quiet: [],
+      shutdown: [],
     },
+    dead_max_jobs: 10_000,
+    dead_timeout_in_seconds: 180 * 24 * 60 * 60 # 6 months
+  }
+
+  DEFAULT_WORKER_OPTIONS = {
+    'retry' => true,
+    'queue' => 'default'
   }
 
   def self.❨╯°□°❩╯︵┻━┻
-    puts "Calm down, bro"
+    puts "Calm down, yo."
   end
 
   def self.options
@@ -64,9 +76,19 @@ module Sidekiq
     defined?(Sidekiq::CLI)
   end
 
-  def self.redis(&block)
-    raise ArgumentError, "requires a block" if !block
-    redis_pool.with(&block)
+  def self.redis
+    raise ArgumentError, "requires a block" unless block_given?
+    redis_pool.with do |conn|
+      retryable = true
+      begin
+        yield conn
+      rescue Redis::CommandError => ex
+        #2550 Failover can cause the server to become a slave, need
+        # to disconnect and reopen the socket to get back to the master.
+        (conn.disconnect!; retryable = false; retry) if retryable && ex.message =~ /READONLY/
+        raise
+      end
+    end
   end
 
   def self.redis_pool
@@ -88,17 +110,31 @@ module Sidekiq
   end
 
   def self.server_middleware
-    @server_chain ||= Processor.default_middleware
+    @server_chain ||= default_server_middleware
     yield @server_chain if block_given?
     @server_chain
   end
 
+  def self.default_server_middleware
+    require 'sidekiq/middleware/server/retry_jobs'
+    require 'sidekiq/middleware/server/logging'
+
+    Middleware::Chain.new do |m|
+      m.add Middleware::Server::Logging
+      m.add Middleware::Server::RetryJobs
+      if defined?(::ActiveRecord::Base)
+        require 'sidekiq/middleware/server/active_record'
+        m.add Sidekiq::Middleware::Server::ActiveRecord
+      end
+    end
+  end
+
   def self.default_worker_options=(hash)
-    @default_worker_options = default_worker_options.merge(hash)
+    @default_worker_options = default_worker_options.merge(hash.stringify_keys)
   end
 
   def self.default_worker_options
-    defined?(@default_worker_options) ? @default_worker_options : { 'retry' => true, 'queue' => 'default' }
+    defined?(@default_worker_options) ? @default_worker_options : DEFAULT_WORKER_OPTIONS
   end
 
   def self.load_json(string)
@@ -117,17 +153,19 @@ module Sidekiq
     Sidekiq::Logging.logger = log
   end
 
-  # The default poll interval is 15 seconds.  This should generally be set to
-  # (Sidekiq process count * 5).  So if you have a dozen Sidekiq processes, set
-  # poll_interval to 60.
-  def self.poll_interval=(interval)
-    self.options[:poll_interval] = interval
+  # How frequently Redis should be checked by a random Sidekiq process for
+  # scheduled and retriable jobs. Each individual process will take turns by
+  # waiting some multiple of this value.
+  #
+  # See sidekiq/scheduled.rb for an in-depth explanation of this value
+  def self.average_scheduled_poll_interval=(interval)
+    self.options[:average_scheduled_poll_interval] = interval
   end
 
   # Register a proc to handle any error which occurs within the Sidekiq process.
   #
   #   Sidekiq.configure_server do |config|
-  #     config.error_handlers << Proc.new {|ex,ctx_hash| MyErrorService.notify(ex, ctx_hash) }
+  #     config.error_handlers << proc {|ex,ctx_hash| MyErrorService.notify(ex, ctx_hash) }
   #   end
   #
   # The default error handler logs errors to Sidekiq.logger.
@@ -144,23 +182,18 @@ module Sidekiq
   #     end
   #   end
   def self.on(event, &block)
-    raise ArgumentError, "Symbols only please: #{event}" if !event.is_a?(Symbol)
-    raise ArgumentError, "Invalid event name: #{event}" if !options[:lifecycle_events].keys.include?(event)
+    raise ArgumentError, "Symbols only please: #{event}" unless event.is_a?(Symbol)
+    raise ArgumentError, "Invalid event name: #{event}" unless options[:lifecycle_events].key?(event)
     options[:lifecycle_events][event] << block
   end
 
-  BANNER = %q{         s
-        ss
-   sss  sss         ss
-   s  sss s   ssss sss   ____  _     _      _    _
-   s     sssss ssss     / ___|(_) __| | ___| | _(_) __ _
-  s         sss         \___ \| |/ _` |/ _ \ |/ / |/ _` |
-  s sssss  s             ___) | | (_| |  __/   <| | (_| |
-  ss    s  s            |____/|_|\__,_|\___|_|\_\_|\__, |
-  s     s s                                           |_|
-        s s
-       sss
-       sss }
+  # We are shutting down Sidekiq but what about workers that
+  # are working on some long job?  This error is
+  # raised in workers that have not finished within the hard
+  # timeout limit.  This is needed to rollback db transactions,
+  # otherwise Ruby's Thread#kill will commit.  See #377.
+  # DO NOT RESCUE THIS ERROR IN YOUR WORKERS
+  class Shutdown < Interrupt; end
 
 end
 

@@ -13,9 +13,9 @@ fr:
   Retries: Tentatives
   Enqueued: En queue
   Worker: Travailleur
-  LivePoll: Live polling
-  StopPolling: Arrêt du polling
-  Queue: File
+  LivePoll: Temps réel
+  StopPolling: Arrêt du temps réel
+  Queue: Queue
   Class: Classe
   Job: Tâche
   Arguments: Arguments
@@ -33,6 +33,7 @@ fr:
   NextRetry: Prochain essai
   RetryCount: Nombre d'essais
   RetryNow: Réessayer maintenant
+  Kill: Tuer
   LastRetry: Dernier essai
   OriginallyFailed: Échec originel
   AreYouSure: Êtes-vous certain ?
@@ -63,6 +64,6 @@ fr:
   NoDeadJobsFound: Aucune tâche morte n'a été trouvée
   Dead: Morte
   Processes: Processus
-  Thread: Fil
-  Threads: Fils
+  Thread: Thread
+  Threads: Threads
   Jobs: Tâches

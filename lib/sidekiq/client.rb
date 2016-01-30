@@ -35,10 +35,8 @@ module Sidekiq
     #   Sidekiq::Client.new(ConnectionPool.new { Redis.new })
     #
     # Generally this is only needed for very large Sidekiq installs processing
-    # more than thousands jobs per second.  I do not recommend sharding unless
-    # you truly cannot scale any other way (e.g. splitting your app into smaller apps).
-    # Some features, like the API, do not support sharding: they are designed to work
-    # against a single Redis instance only.
+    # thousands of jobs per second.  I don't recommend sharding unless you
+    # cannot scale any other way (e.g. splitting your app into smaller apps).
     def initialize(redis_pool=nil)
       @redis_pool = redis_pool || Thread.current[:sidekiq_via_pool] || Sidekiq.redis_pool
     end
@@ -49,13 +47,14 @@ module Sidekiq
     #   queue - the named queue to use, default 'default'
     #   class - the worker class to call, required
     #   args - an array of simple arguments to the perform method, must be JSON-serializable
-    #   retry - whether to retry this job if it fails, true or false, default true
+    #   retry - whether to retry this job if it fails, default true or an integer number of retries
     #   backtrace - whether to save any error backtrace, default false
     #
     # All options must be strings, not symbols.  NB: because we are serializing to JSON, all
-    # symbols in 'args' will be converted to strings.
+    # symbols in 'args' will be converted to strings.  Note that +backtrace: true+ can take quite a bit of
+    # space in Redis; a large volume of failing jobs can start Redis swapping if you aren't careful.
     #
-    # Returns nil if not pushed to Redis or a unique Job ID if pushed.
+    # Returns a unique Job ID.  If middleware stops the job, nil will be returned instead.
     #
     # Example:
     #   push('queue' => 'my_queue', 'class' => MyWorker, 'args' => ['foo', 1, :bat => 'bar'])
@@ -64,25 +63,24 @@ module Sidekiq
       normed = normalize_item(item)
       payload = process_single(item['class'], normed)
 
-      pushed = false
-      pushed = raw_push([payload]) if payload
-      pushed ? payload['jid'] : nil
+      if payload
+        raw_push([payload])
+        payload['jid']
+      end
     end
 
     ##
     # Push a large number of jobs to Redis.  In practice this method is only
-    # useful if you are pushing tens of thousands of jobs or more, or if you need
-    # to ensure that a batch doesn't complete prematurely.  This method
-    # basically cuts down on the redis round trip latency.
+    # useful if you are pushing thousands of jobs or more.  This method
+    # cuts out the redis network round trip latency.
     #
     # Takes the same arguments as #push except that args is expected to be
     # an Array of Arrays.  All other keys are duplicated for each job.  Each job
     # is run through the client middleware pipeline and each job gets its own Job ID
     # as normal.
     #
-    # Returns an array of the of pushed jobs' jids or nil if the pushed failed.  The number of jobs
-    # pushed can be less than the number given if the middleware stopped processing for one
-    # or more jobs.
+    # Returns an array of the of pushed jobs' jids.  The number of jobs pushed can be less
+    # than the number given if the middleware stopped processing for one or more jobs.
     def push_bulk(items)
       normed = normalize_item(items)
       payloads = items['args'].map do |args|
@@ -90,9 +88,8 @@ module Sidekiq
         process_single(items['class'], normed.merge('args' => args, 'jid' => SecureRandom.hex(12), 'enqueued_at' => Time.now.to_f))
       end.compact
 
-      pushed = false
-      pushed = raw_push(payloads) if !payloads.empty?
-      pushed ? payloads.collect { |payload| payload['jid'] } : nil
+      raw_push(payloads) if !payloads.empty?
+      payloads.collect { |payload| payload['jid'] }
     end
 
     # Allows sharding of jobs across any number of Redis instances.  All jobs
@@ -105,10 +102,8 @@ module Sidekiq
     #   end
     #
     # Generally this is only needed for very large Sidekiq installs processing
-    # more than thousands jobs per second.  I do not recommend sharding unless
-    # you truly cannot scale any other way (e.g. splitting your app into smaller apps).
-    # Some features, like the API, do not support sharding: they are designed to work
-    # against a single Redis instance.
+    # thousands of jobs per second.  I do not recommend sharding unless
+    # you cannot scale any other way (e.g. splitting your app into smaller apps).
     def self.via(pool)
       raise ArgumentError, "No pool given" if pool.nil?
       raise RuntimeError, "Sidekiq::Client.via is not re-entrant" if x = Thread.current[:sidekiq_via_pool] && x != pool
@@ -120,16 +115,12 @@ module Sidekiq
 
     class << self
 
-      def default
-        @default ||= new
-      end
-
       def push(item)
-        default.push(item)
+        new.push(item)
       end
 
       def push_bulk(items)
-        default.push_bulk(items)
+        new.push_bulk(items)
       end
 
       # Resque compatibility helpers.  Note all helpers
@@ -160,7 +151,7 @@ module Sidekiq
         ts = (int < 1_000_000_000 ? now + int : int)
 
         item = { 'class' => klass, 'args' => args, 'at' => ts, 'queue' => queue }
-        item.delete('at') if ts <= now
+        item.delete('at'.freeze) if ts <= now
 
         klass.client_push(item)
       end
@@ -176,23 +167,30 @@ module Sidekiq
     private
 
     def raw_push(payloads)
-      pushed = false
       @redis_pool.with do |conn|
-        if payloads.first['at']
-          pushed = conn.zadd('schedule', payloads.map do |hash|
-            at = hash.delete('at').to_s
-            [at, Sidekiq.dump_json(hash)]
-          end)
-        else
-          q = payloads.first['queue']
-          to_push = payloads.map { |entry| Sidekiq.dump_json(entry) }
-          _, pushed = conn.multi do
-            conn.sadd('queues', q)
-            conn.lpush("queue:#{q}", to_push)
-          end
+        conn.multi do
+          atomic_push(conn, payloads)
         end
       end
-      pushed
+      true
+    end
+
+    def atomic_push(conn, payloads)
+      if payloads.first['at']
+        conn.zadd('schedule'.freeze, payloads.map do |hash|
+          at = hash.delete('at'.freeze).to_s
+          [at, Sidekiq.dump_json(hash)]
+        end)
+      else
+        q = payloads.first['queue']
+        now = Time.now.to_f
+        to_push = payloads.map do |entry|
+          entry['enqueued_at'.freeze] = now
+          Sidekiq.dump_json(entry)
+        end
+        conn.sadd('queues'.freeze, q)
+        conn.lpush("queue:#{q}", to_push)
+      end
     end
 
     def process_single(worker_class, item)
@@ -204,24 +202,27 @@ module Sidekiq
     end
 
     def normalize_item(item)
-      raise(ArgumentError, "Message must be a Hash of the form: { 'class' => SomeWorker, 'args' => ['bob', 1, :foo => 'bar'] }") unless item.is_a?(Hash)
-      raise(ArgumentError, "Message must include a class and set of arguments: #{item.inspect}") if !item['class'] || !item['args']
-      raise(ArgumentError, "Message args must be an Array") unless item['args'].is_a?(Array)
-      raise(ArgumentError, "Message class must be either a Class or String representation of the class name") unless item['class'].is_a?(Class) || item['class'].is_a?(String)
+      raise(ArgumentError, "Job must be a Hash with 'class' and 'args' keys: { 'class' => SomeWorker, 'args' => ['bob', 1, :foo => 'bar'] }") unless item.is_a?(Hash) && item.has_key?('class'.freeze) && item.has_key?('args'.freeze)
+      raise(ArgumentError, "Job args must be an Array") unless item['args'].is_a?(Array)
+      raise(ArgumentError, "Job class must be either a Class or String representation of the class name") unless item['class'.freeze].is_a?(Class) || item['class'.freeze].is_a?(String)
 
-      if item['class'].is_a?(Class)
-        raise(ArgumentError, "Message must include a Sidekiq::Worker class, not class name: #{item['class'].ancestors.inspect}") if !item['class'].respond_to?('get_sidekiq_options')
-        normalized_item = item['class'].get_sidekiq_options.merge(item)
-        normalized_item['class'] = normalized_item['class'].to_s
-      else
-        normalized_item = Sidekiq.default_worker_options.merge(item)
-      end
+      normalized_hash(item['class'.freeze])
+        .each{ |key, value| item[key] = value if item[key].nil? }
 
-      normalized_item['queue'] = normalized_item['queue'].to_s
-      normalized_item['jid'] ||= SecureRandom.hex(12)
-      normalized_item['enqueued_at'] ||= Time.now.to_f
-      normalized_item
+      item['class'.freeze] = item['class'.freeze].to_s
+      item['queue'.freeze] = item['queue'.freeze].to_s
+      item['jid'.freeze] ||= SecureRandom.hex(12)
+      item['created_at'.freeze] ||= Time.now.to_f
+      item
     end
 
+    def normalized_hash(item_class)
+      if item_class.is_a?(Class)
+        raise(ArgumentError, "Message must include a Sidekiq::Worker class, not class name: #{item_class.ancestors.inspect}") if !item_class.respond_to?('get_sidekiq_options'.freeze)
+        item_class.get_sidekiq_options
+      else
+        Sidekiq.default_worker_options
+      end
+    end
   end
 end

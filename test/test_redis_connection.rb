@@ -1,5 +1,4 @@
-require 'helper'
-require 'sidekiq/redis_connection'
+require_relative 'helper'
 
 class TestRedisConnection < Sidekiq::Test
 
@@ -69,6 +68,14 @@ class TestRedisConnection < Sidekiq::Test
   end
 
   describe ".determine_redis_provider" do
+
+    before do
+      @old_env = ENV.to_hash
+    end
+
+    after do
+      ENV.update(@old_env)
+    end
 
     def with_env_var(var, uri, skip_provider=false)
       vars = ['REDISTOGO_URL', 'REDIS_PROVIDER', 'REDIS_URL'] - [var]

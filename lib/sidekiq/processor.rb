@@ -1,148 +1,184 @@
 require 'sidekiq/util'
-require 'sidekiq/actor'
-
-require 'sidekiq/middleware/server/active_record'
-require 'sidekiq/middleware/server/retry_jobs'
-require 'sidekiq/middleware/server/logging'
+require 'sidekiq/fetch'
+require 'thread'
+require 'concurrent/map'
+require 'concurrent/atomic/atomic_fixnum'
 
 module Sidekiq
   ##
-  # The Processor receives a message from the Manager and actually
-  # processes it.  It instantiates the worker, runs the middleware
-  # chain and then calls Sidekiq::Worker#perform.
+  # The Processor is a standalone thread which:
+  #
+  # 1. fetches a job from Redis
+  # 2. executes the job
+  #   a. instantiate the Worker
+  #   b. run the middleware chain
+  #   c. call #perform
+  #
+  # A Processor can exit due to shutdown (processor_stopped)
+  # or due to an error during job execution (processor_died)
+  #
+  # If an error occurs in the job execution, the
+  # Processor calls the Manager to create a new one
+  # to replace itself and exits.
+  #
   class Processor
-    # To prevent a memory leak, ensure that stats expire. However, they should take up a minimal amount of storage
-    # so keep them around for a long time
-    STATS_TIMEOUT = 24 * 60 * 60 * 365 * 5
 
     include Util
-    include Actor
 
-    def self.default_middleware
-      Middleware::Chain.new do |m|
-        m.add Middleware::Server::Logging
-        m.add Middleware::Server::RetryJobs
-        m.add Middleware::Server::ActiveRecord
+    attr_reader :thread
+    attr_reader :job
+
+    def initialize(mgr)
+      @mgr = mgr
+      @down = false
+      @done = false
+      @job = nil
+      @thread = nil
+      @strategy = (mgr.options[:fetch] || Sidekiq::BasicFetch).new(mgr.options)
+    end
+
+    def terminate(wait=false)
+      @done = true
+      return if !@thread
+      @thread.value if wait
+    end
+
+    def kill(wait=false)
+      @done = true
+      return if !@thread
+      # unlike the other actors, terminate does not wait
+      # for the thread to finish because we don't know how
+      # long the job will take to finish.  Instead we
+      # provide a `kill` method to call after the shutdown
+      # timeout passes.
+      @thread.raise ::Sidekiq::Shutdown
+      @thread.value if wait
+    end
+
+    def start
+      @thread ||= safe_thread("processor", &method(:run))
+    end
+
+    private unless $TESTING
+
+    def run
+      begin
+        while !@done
+          process_one
+        end
+        @mgr.processor_stopped(self)
+      rescue Sidekiq::Shutdown
+        @mgr.processor_stopped(self)
+      rescue Exception => ex
+        @mgr.processor_died(self, ex)
       end
     end
 
-    attr_accessor :proxy_id
+    def process_one
+      @job = fetch
+      process(@job) if @job
+      @job = nil
+    end
 
-    def initialize(boss)
-      @boss = boss
+    def get_one
+      begin
+        work = @strategy.retrieve_work
+        (logger.info { "Redis is online, #{Time.now - @down} sec downtime" }; @down = nil) if @down
+        work
+      rescue Sidekiq::Shutdown
+      rescue => ex
+        handle_fetch_exception(ex)
+      end
+    end
+
+    def fetch
+      j = get_one
+      if j && @done
+        j.requeue
+        nil
+      else
+        j
+      end
+    end
+
+    def handle_fetch_exception(ex)
+      if !@down
+        @down = Time.now
+        logger.error("Error fetching job: #{ex}")
+        ex.backtrace.each do |bt|
+          logger.error(bt)
+        end
+      end
+      sleep(1)
     end
 
     def process(work)
-      msgstr = work.message
+      jobstr = work.job
       queue = work.queue_name
 
-      @boss.async.real_thread(proxy_id, Thread.current)
-
-      ack = true
+      ack = false
       begin
-        msg = Sidekiq.load_json(msgstr)
-        klass  = msg['class'].constantize
+        job = Sidekiq.load_json(jobstr)
+        klass  = job['class'.freeze].constantize
         worker = klass.new
-        worker.jid = msg['jid']
+        worker.jid = job['jid'.freeze]
 
-        stats(worker, msg, queue) do
-          Sidekiq.server_middleware.invoke(worker, msg, queue) do
-            worker.perform(*cloned(msg['args']))
+        stats(worker, job, queue) do
+          Sidekiq.server_middleware.invoke(worker, job, queue) do
+            # Only ack if we either attempted to start this job or
+            # successfully completed it. This prevents us from
+            # losing jobs if a middleware raises an exception before yielding
+            ack = true
+            execute_job(worker, cloned(job['args'.freeze]))
           end
         end
+        ack = true
       rescue Sidekiq::Shutdown
         # Had to force kill this job because it didn't finish
         # within the timeout.  Don't acknowledge the work since
         # we didn't properly finish it.
         ack = false
       rescue Exception => ex
-        handle_exception(ex, msg || { :message => msgstr })
+        handle_exception(ex, job || { :job => jobstr })
         raise
       ensure
         work.acknowledge if ack
       end
-
-      @boss.async.processor_done(current_actor)
     end
 
-    def inspect
-      "<Processor##{object_id.to_s(16)}>"
+    def execute_job(worker, cloned_args)
+      worker.perform(*cloned_args)
     end
-
-    private
 
     def thread_identity
       @str ||= Thread.current.object_id.to_s(36)
     end
 
-    def stats(worker, msg, queue)
-      # Do not conflate errors from the job with errors caused by updating
-      # stats so calling code can react appropriately
-      retry_and_suppress_exceptions do
-        hash = Sidekiq.dump_json({:queue => queue, :payload => msg, :run_at => Time.now.to_i })
-        Sidekiq.redis do |conn|
-          conn.multi do
-            conn.hmset("#{identity}:workers", thread_identity, hash)
-            conn.expire("#{identity}:workers", 60*60)
-          end
-        end
-      end
+    WORKER_STATE = Concurrent::Map.new
+    PROCESSED = Concurrent::AtomicFixnum.new
+    FAILURE = Concurrent::AtomicFixnum.new
+
+    def stats(worker, job, queue)
+      tid = thread_identity
+      WORKER_STATE[tid] = {:queue => queue, :payload => job, :run_at => Time.now.to_i }
 
       begin
         yield
       rescue Exception
-        retry_and_suppress_exceptions do
-          Sidekiq.redis do |conn|
-            failed = "stat:failed:#{Time.now.utc.to_date}"
-            result = conn.multi do
-              conn.incrby("stat:failed", 1)
-              conn.incrby(failed, 1)
-            end
-            conn.expire(failed, STATS_TIMEOUT) if result.last == 1
-          end
-        end
+        FAILURE.increment
         raise
       ensure
-        retry_and_suppress_exceptions do
-          Sidekiq.redis do |conn|
-            processed = "stat:processed:#{Time.now.utc.to_date}"
-            result = conn.multi do
-              conn.hdel("#{identity}:workers", thread_identity)
-              conn.incrby("stat:processed", 1)
-              conn.incrby(processed, 1)
-            end
-            conn.expire(processed, STATS_TIMEOUT) if result.last == 1
-          end
-        end
+        WORKER_STATE.delete(tid)
+        PROCESSED.increment
       end
     end
 
-    # Singleton classes are not clonable.
-    SINGLETON_CLASSES = [ NilClass, TrueClass, FalseClass, Symbol, Fixnum, Float, Bignum ].freeze
-
     # Deep clone the arguments passed to the worker so that if
-    # the message fails, what is pushed back onto Redis hasn't
+    # the job fails, what is pushed back onto Redis hasn't
     # been mutated by the worker.
     def cloned(ary)
       Marshal.load(Marshal.dump(ary))
     end
 
-    # If an exception occurs in the block passed to this method, that block will be retried up to max_retries times.
-    # All exceptions will be swallowed and logged.
-    def retry_and_suppress_exceptions(max_retries = 2)
-      retry_count = 0
-      begin
-        yield
-      rescue => e
-        retry_count += 1
-        if retry_count <= max_retries
-          Sidekiq.logger.debug {"Suppressing and retrying error: #{e.inspect}"}
-          sleep(1)
-          retry
-        else
-          handle_exception(e, { :message => "Exhausted #{max_retries} retries"})
-        end
-      end
-    end
   end
 end
